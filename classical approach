@@ -1,0 +1,369 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv("converted_file 1.csv")
+
+df.shape
+print(df.info())
+print(df.describe(include='all'))
+missing = df.isnull().sum().sort_values(ascending=False)
+print(missing.head(20))
+drop_cols = [col for col in df.columns if 'oth' in col.lower()]
+
+df = df.drop(columns=drop_cols)
+threshold = 0.8 * len(df)
+
+df = df.dropna(axis=1, thresh=threshold)
+df.shape
+state_counts = df["state_name"].value_counts()
+
+print(state_counts)
+state_counts.plot(kind="bar", figsize=(12,5))
+plt.title("Sample Size per State")
+plt.show()
+cols_use = [
+    # basic
+    'state_name','state_group','residence',
+    'a2b_age','a2c','rec_a2d','rec_a2e','a2f','a2i',
+
+    # insurance
+    'any_insurance','c10a','c10b','c10d','c10e','c10c',
+
+    # provider
+    'b1_most',
+
+    # health
+    'a3','a4',
+
+    # satisfaction
+    "b6p","b6q","b6r","b6s","b6v","b6w","b6y",
+
+    # cost
+    'oope_total_op','b6b','b6c','b6e',
+
+    # access
+    'b6m','b6i','b6j','b6n',
+
+    # system-level
+    'uhc_index','uhc_index_terciles',
+    #insurance
+    'b6f'
+]
+df_clean = df[cols_use].copy()
+import numpy as np
+sat_cols = ["b6p","b6q","b6r","b6s","b6w","b6y"]
+
+for col in sat_cols:
+    df_clean[col] = df_clean[col].replace({ 'Yes': 1,'No': 0,'CNS': np.nan, 'DNA': np.nan })
+df_clean['b6v'] = df_clean['b6v'].replace({'Yes-completely': 1,'Yes-partially': 0.5,'No': 0,'CNS': np.nan,'DNA': np.nan})
+for col in sat_cols + ['b6v']:
+    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+df_clean['overall_sat'] = df_clean[sat_cols + ['b6v']].mean(axis=1)
+print(df_clean['overall_sat'].describe())
+state_sat = df_clean.groupby('state_name')['overall_sat'].mean().sort_values()
+
+plt.figure(figsize=(12,6))
+state_sat.plot(kind='bar')
+plt.title("State-wise Average Satisfaction")
+plt.ylabel("Satisfaction Score")
+plt.xticks(rotation=90)
+plt.show()
+state_stats = df_clean.groupby('state_name')['overall_sat'].agg(['mean','std','count'])
+
+state_stats['se'] = state_stats['std'] / np.sqrt(state_stats['count'])
+state_stats = state_stats.sort_values('mean')
+plt.figure(figsize=(12,6))
+
+plt.errorbar(
+    state_stats.index,
+    state_stats['mean'],
+    yerr=state_stats['se'],
+    fmt='o'
+)
+
+plt.xticks(rotation=90)
+plt.title("State-wise Satisfaction with Uncertainty (SE)")
+plt.ylabel("Satisfaction")
+plt.show()
+plt.figure()
+
+plt.scatter(state_stats['count'], state_stats['se'])
+plt.xlabel("Sample Size")
+plt.ylabel("Standard Error")
+plt.title("Sample Size vs Uncertainty")
+plt.show()
+from scipy import stats
+
+print(stats.shapiro(df_clean['overall_sat'] .dropna()))
+print(df['residence'].value_counts())
+
+urban = df_clean[df_clean['residence']=="Urban"]['overall_sat'].dropna()
+rural = df_clean[df_clean['residence']=="Rural"]['overall_sat'].dropna()
+
+print(len(urban), len(rural))
+
+# Use Mann-Whitney (non-parametric)
+u_stat, p = stats.mannwhitneyu(urban, rural)
+
+print("Mann-Whitney p-value:", p)
+print("Urban mean:", urban.mean())
+print("Rural mean:", rural.mean())
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+# Make sure no missing values
+df_anova = df_clean[['state_name','overall_sat']].dropna()
+
+# Fit ANOVA model
+model = smf.ols('overall_sat ~ C(state_name)', data=df_anova).fit()
+
+# ANOVA table
+anova_table = sm.stats.anova_lm(model, typ=2)
+
+print(anova_table)
+df_clean['provider_type'] = df_clean['b1_most'].str.lower()
+
+df_clean['provider_type'] = df_clean['provider_type'].apply(lambda x: 'Public' if isinstance(x, str) and 'gov' in x else 'Private')
+df_clean['insured'] = df_clean['any_insurance'].map({'Yes': 1,'No': 0})
+df_clean['log_cost'] = np.log1p(df_clean['oope_total_op'])
+state_stats = df_clean.groupby('state_name')['overall_sat'].agg(['mean','std','count'])
+
+state_stats['se'] = state_stats['std'] / np.sqrt(state_stats['count'])
+state_stats = state_stats.sort_values('mean')
+global_mean = df_clean['overall_sat'].mean()
+k = 100
+
+state_stats['bayes_mean'] = ((state_stats['count'] * state_stats['mean'] + k * global_mean) /(state_stats['count'] + k))
+plt.figure(figsize=(12,6))
+
+plt.errorbar(
+    state_stats.index,
+    state_stats['mean'],
+    yerr=state_stats['se'],
+    fmt='o'
+)
+
+plt.xticks(rotation=90)
+plt.title("State Satisfaction with Uncertainty")
+plt.show()
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.violinplot(
+    x='provider_type',
+    y='overall_sat',
+    data=df_clean,
+    inner='quartile'
+)
+
+plt.title("Public vs Private Satisfaction Distribution")
+plt.xlabel("Provider Type")
+plt.ylabel("Satisfaction Score")
+
+plt.show()
+import statsmodels.formula.api as smf
+
+model = smf.ols('overall_sat ~ log_cost + b6m + b6i + C(provider_type) + C(residence) + C(insured)',data=df_clean).fit()
+print(model.summary())
+df_clean["insured"] = df_clean["any_insurance"].replace({"Have Insurance": 1,"No": 0})
+
+# Convert to numeric
+df_clean["insured"] = pd.to_numeric(df_clean["insured"], errors="coerce")
+df_clean['state_name'].unique()
+# Define regions properly
+north = [
+    "Uttar Pradesh", "Punjab", "Haryana", "Rajasthan",
+    "Uttarakhand", "Himachal Pradesh", "Jammu & Kashmir", "Nct Of Delhi"
+]
+
+south = [
+    "Tamil Nadu", "Kerala", "Karnataka",
+    "Andhra Pradesh", "Telangana"
+]
+
+northeast = [
+    "Assam", "Arunachal Pradesh", "Manipur",
+    "Meghalaya", "Mizoram", "Nagaland",
+    "Tripura", "Sikkim"
+]
+
+# Function to assign region
+def get_region(state):
+    if state in north:
+        return "North"
+    elif state in south:
+        return "South"
+    elif state in northeast:
+        return "Northeast"
+    else:
+        return "Central/Other"
+
+# Apply
+df_clean["region"] = df_clean["state_name"].apply(get_region)
+print(df_clean["region"].value_counts())
+print(df_clean.groupby("region")["state_name"].unique())
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Compute means
+region_stats = df_clean.groupby(['region','insured'])['overall_sat'].mean().reset_index()
+
+# Plot
+sns.barplot(
+    data=region_stats,
+    x='region',
+    y='overall_sat',
+    hue='insured'
+)
+
+plt.xticks(rotation=0)
+plt.title("Average Satisfaction by Insurance Status Across Regions")
+plt.ylabel("Mean Satisfaction")
+
+# FIX LEGEND LABELS
+handles, _ = plt.gca().get_legend_handles_labels()
+plt.legend(handles, ["Uninsured", "Insured"], title="Insurance Status")
+
+plt.show()
+import numpy as np
+import pandas as pd
+
+state_data = df_clean.groupby('state_name').agg({
+    'overall_sat': 'mean',
+    'insured': 'mean',
+    'b6m': 'mean',   # waiting time
+    'b6i': 'mean',   # travel time
+    'b6p': 'mean',   # doctor time
+    'b6q': 'mean',   # staff behavior
+    'b6r': 'mean',   # communication
+    'uhc_index': 'mean'
+}).reset_index()
+
+# Rename for clarity
+state_data = state_data.rename(columns={
+    'overall_sat': 'satisfaction',
+    'insured': 'insurance_rate',
+    'b6m': 'waiting_time',
+    'b6i': 'travel_time',
+    'b6p': 'doctor_time',
+    'b6q': 'staff_behavior',
+    'b6r': 'communication'})
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+
+features = state_data[[
+    'satisfaction',
+    'insurance_rate',
+    'waiting_time',
+    'travel_time',
+    'doctor_time',
+    'staff_behavior',
+    'communication']]
+
+scaler = StandardScaler()
+scaled = scaler.fit_transform(features)
+
+kmeans = KMeans(n_clusters=3, random_state=42)
+state_data['cluster'] = kmeans.fit_predict(scaled)
+import pandas as pd
+
+# convert to string and clean
+df_clean['c10c_clean'] = df_clean['c10c'].astype(str).str.lower().str.strip()
+
+# remove empty / meaningless values
+df_clean['c10c_clean'] = df_clean['c10c_clean'].replace(['', 'nan', 'none', 'no', 'yes', 'nahi', 'na', 'ok', 'good'], pd.NA)
+def map_scheme(x):
+    if pd.isna(x):
+        return 'No Scheme'
+
+    if 'ayush' in x:
+        return 'Ayushman Bharat'
+
+    elif 'arogya' in x or 'aarogya' in x:
+        return 'Aarogyasri'
+
+    elif 'biju' in x or 'bsky' in x:
+        return 'Biju Swasthya Yojana'
+
+    elif 'swasthya sathi' in x or 'sathi' in x:
+        return 'Swasthya Sathi'
+
+    elif 'chiranjeevi' in x or 'chiranjivi' in x:
+        return 'Chiranjeevi Yojana'
+
+    elif 'amrit' in x:
+        return 'Atal Amrit'
+
+    elif 'esi' in x or 'esic' in x:
+        return 'ESI'
+
+    elif 'cghs' in x:
+        return 'CGHS'
+
+    elif 'insurance' in x:
+        return 'Private Insurance'
+
+    else:
+        return 'Other Scheme'
+
+df_clean['scheme_category'] = df_clean['c10c_clean'].apply(map_scheme)
+df_clean.groupby('scheme_category')['overall_sat'].mean()
+df_clean['used_insurance'] = (df_clean['b6f'] > 0)
+df_clean.groupby('any_insurance').agg({'used_insurance': 'mean','overall_sat': 'mean'})
+df_clean.groupby('scheme_category').agg({'used_insurance': 'mean','overall_sat': 'mean'})
+df_clean.groupby('scheme_category')['overall_sat'].mean().sort_values().plot(kind='bar')
+
+plt.xlabel('Scheme')
+plt.ylabel('Average Satisfaction')
+plt.title('Satisfaction across Health Schemes')
+plt.xticks(rotation=45)
+plt.show()
+df_clean['used_insurance'] = (df_clean['b6f'] > 0)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from sklearn.cluster import KMeans
+
+sns.set_style('white')  # removed grid
+sns.set_context('talk')
+
+df_clean['used_insurance'] = df_clean['b6f'] > 0
+
+state_data = df_clean.groupby('state_name').agg(
+    utilised=('used_insurance', 'mean'),
+    satisfaction_score=('overall_sat', 'mean')
+).reset_index()
+
+
+X = state_data[['utilised', 'satisfaction_score']]
+kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+state_data['cluster'] = kmeans.fit_predict(X)
+
+
+plt.figure(figsize=(10,6))
+
+sns.scatterplot(
+    data=state_data,
+    x='utilised',
+    y='satisfaction_score',
+    hue='cluster',
+    palette='Set1',
+    s=100
+)
+
+# Labels
+for i in range(len(state_data)):
+    plt.text(
+        state_data['utilised'].iloc[i] + 0.002,
+        state_data['satisfaction_score'].iloc[i] + 0.002,
+        state_data['state_name'].iloc[i],
+        fontsize=8
+    )
+
+plt.title('State Clusters: Satisfaction vs Utilisation')
+plt.xlabel('Utilisation Rate')
+plt.ylabel('Average Satisfaction Score')
+plt.legend(title='Cluster')
+
+plt.tight_layout()
+plt.show()
