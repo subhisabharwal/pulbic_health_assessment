@@ -1,0 +1,411 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv(r"C:\Users\ASUS\Downloads\converted_file.csv")
+
+print(df.shape)
+print(df.info())
+print(df.describe(include='all'))
+missing = df.isnull().sum().sort_values(ascending=False)
+print(missing.head(20))
+drop_cols = [col for col in df.columns if 'oth' in col.lower()]
+
+df = df.drop(columns=drop_cols)
+threshold = 0.8 * len(df)
+
+df = df.dropna(axis=1, thresh=threshold)
+df.shape
+cols_use = [
+    'state_name',
+    'residence',
+    'a2b_age',
+    'a2c',
+    'any_insurance',
+    "b6p","b6q","b6r","b6s","b6v","b6w","b6y",
+    'oope_total_op',
+    'b6m','b6i']
+
+df_clean = df[cols_use].copy()
+import numpy as np
+sat_cols = ["b6p","b6q","b6r","b6s","b6w","b6y"]
+
+for col in sat_cols:
+    df_clean[col] = df_clean[col].replace({
+        'Yes': 1,
+        'No': 0,
+        'CNS': np.nan,
+        'DNA': np.nan})
+for col in sat_cols:
+    print(col, df_clean[col].unique()[:5])
+df_clean['b6v'] = df_clean['b6v'].replace({
+    'Yes-completely': 1,
+    'Yes-partially': 0.5,
+    'No': 0,
+    'CNS': np.nan,
+    'DNA': np.nan})
+for col in sat_cols + ['b6v']:
+    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+df_clean['overall_sat'] = df_clean[sat_cols + ['b6v']].mean(axis=1)
+print(df_clean['overall_sat'].describe())
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+sat_cols = ["b6p","b6q","b6r","b6s","b6w","b6y"]
+
+for col in sat_cols:
+    df_clean[col] = df_clean[col].replace({
+        'Yes': 1,
+        'No': 0,
+        'CNS': np.nan,
+        'DNA': np.nan})
+df_clean["satisfaction"] = df_clean[sat_cols].mean(axis=1)
+
+# Binary satisfaction (for GLMM/GEE)
+df_clean["satisfaction_binary"] = (df_clean["satisfaction"] >= 0.5).astype(int)
+if "insurance" in df_clean.columns:
+    df_clean["any_insurance"] = df_clean["insurance"].apply(
+        lambda x: 1 if x == "Yes" else 0
+    )
+else:
+    df_clean["any_insurance"] = 0
+
+# Residence (urban/rural)
+if "residence" not in df_clean.columns:
+    df_clean["residence"] = "Urban"
+north = ['Delhi','Haryana','Punjab','Uttar Pradesh','Himachal Pradesh','Jammu & Kashmir']
+south = ['Tamil Nadu','Kerala','Karnataka','Andhra Pradesh','Telangana']
+northeast = ['Assam','Meghalaya','Manipur','Mizoram','Nagaland','Tripura','Arunachal Pradesh']
+
+def map_region(state):
+    if state in north:
+        return "North"
+    elif state in south:
+        return "South"
+    elif state in northeast:
+        return "Northeast"
+    else:
+        return "Other"
+
+df_clean["region"] = df_clean["state_name"].apply(map_region)
+df_model = df_clean.dropna(subset=["satisfaction", "state_name"]).copy()
+
+df_model["state_name"] = df_model["state_name"].astype("category")
+df_model["region"] = df_model["region"].astype("category")
+df_model["any_insurance"] = df_model["any_insurance"].astype("category")
+df_model["residence"] = df_model["residence"].astype("category")
+state_classical = (df_model.groupby("state_name")["satisfaction"].mean().sort_values())
+print("\nClassical State Means:\n", state_classical.head())
+print("\n MIXED EFFECTS MODEL")
+
+lmm = smf.mixedlm(
+    "satisfaction ~ any_insurance + residence + region",
+    data=df_model,
+    groups=df_model["state_name"])
+
+lmm_result = lmm.fit()
+print(lmm_result.summary())
+state_effects = pd.DataFrame(lmm_result.random_effects).T
+state_effects.columns = ["state_effect"]
+
+states = df_model["state_name"].cat.categories
+
+state_df = pd.DataFrame({
+    "state": states,
+    "mixed_effect": state_effects["state_effect"].values
+}).sort_values("mixed_effect")
+
+print("\nMixed Effects (State-level):\n", state_df.head())
+df_model["predicted"] = lmm_result.predict(df_model)
+
+state_pred = df_model.groupby("state_name")["predicted"].mean()
+comparison = pd.DataFrame({"classical": state_classical,"mixed": state_pred})
+
+plt.figure()
+plt.scatter(comparison["classical"], comparison["mixed"])
+plt.plot([comparison.min().min(), comparison.max().max()],[comparison.min().min(), comparison.max().max()], 'r--')
+
+plt.xlabel("Classical Mean")
+plt.ylabel("Mixed Model Estimate")
+plt.title("Classical vs Mixed Effects")
+plt.show()
+
+rank_df = pd.DataFrame({
+    "classical_rank": comparison["classical"].rank(ascending=False),
+    "mixed_rank": comparison["mixed"].rank(ascending=False)})
+
+rank_df["rank_change"] = rank_df["classical_rank"] - rank_df["mixed_rank"]
+
+print("\nBiggest upward movers:")
+print(rank_df.sort_values("rank_change").head(10))
+
+print("\nBiggest downward movers:")
+print(rank_df.sort_values("rank_change").tail(10))
+
+sample_size = df_model["state_name"].value_counts()
+
+comparison = comparison.merge(
+    sample_size,
+    left_index=True,
+    right_index=True)
+
+comparison.columns = ["classical", "mixed", "sample_size"]
+
+comparison["difference"] = comparison["mixed"] - comparison["classical"]
+
+plt.figure()
+plt.scatter(comparison["sample_size"], abs(comparison["difference"]))
+plt.xlabel("Sample Size")
+plt.ylabel("Adjustment Magnitude")
+plt.title("Sample Size vs Adjustment")
+plt.show()
+print("\nGEE MODEL")
+
+gee_model = smf.gee(
+    "satisfaction_binary ~ any_insurance + residence + region",
+    groups="state_name",
+    data=df_model,
+    family=sm.families.Binomial())
+
+gee_result = gee_model.fit()
+print(gee_result.summary())
+
+state_df.to_csv("state_effects_mixed.csv", index=False)
+comparison.to_csv("comparison_results.csv")
+
+print("\nAll results saved successfully")
+
+# STATE-WISE MIXED MODEL SATISFACTION PLOT
+# Convert to dataframe
+state_plot_df = state_
+pred.reset_index()
+state_plot_df.columns = ["state", "adjusted_satisfaction"]
+
+# Sort for better visualization
+state_plot_df = state_plot_df.sort_values("adjusted_satisfaction")
+
+# Plot
+plt.figure(figsize=(14,6))
+plt.bar(state_plot_df["state"], state_plot_df["adjusted_satisfaction"])
+
+plt.xticks(rotation=90)
+plt.xlabel("State")
+plt.ylabel("Adjusted Satisfaction (Mixed Model)")
+plt.title("State-wise Adjusted Satisfaction (Frequentist Mixed Effects Model)")
+
+plt.tight_layout()
+plt.show()
+state_plot_df = pd.DataFrame({
+    "state_name": state_pred.index,
+    "adjusted_satisfaction": state_pred.values,
+    "classical_satisfaction": state_classical.values})
+state_plot_df = state_plot_df.sort_values("adjusted_satisfaction")
+plt.figure(figsize=(14,6))
+
+plt.bar(state_plot_df["state_name"], state_plot_df["adjusted_satisfaction"])
+
+plt.xticks(rotation=90)
+plt.xlabel("State")
+plt.ylabel("Adjusted Satisfaction Score")
+plt.title("State-wise Healthcare Satisfaction (Mixed Effects Adjusted)")
+
+plt.tight_layout()
+plt.show()
+# Highlight top/bottom movers
+top_states = rank_df.sort_values("rank_change").head(5).index
+bottom_states = rank_df.sort_values("rank_change").tail(5).index
+
+colors = []
+
+for state in state_plot_df["state_name"]:
+    if state in top_states:
+        colors.append("red")     # big upward correction
+    elif state in bottom_states:
+        colors.append("green")   # big downward correction
+    else:
+        colors.append("gray")
+
+plt.figure(figsize=(14,6))
+plt.bar(state_plot_df["state_name"], state_plot_df["adjusted_satisfaction"], color=colors)
+
+plt.xticks(rotation=90)
+plt.title("State-wise Adjusted Satisfaction (Highlighted Rank Changes)")
+plt.show()
+# 1. IMPORT LIBRARIES
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.formula.api as smf
+
+# 2. CLEAN SATISFACTION VARIABLES
+
+sat_cols = ["b6p","b6q","b6r","b6s","b6w","b6y"]
+
+for col in sat_cols:
+    df_clean[col] = df_clean[col].replace({
+        'Yes': 1,
+        'No': 0,
+        'CNS': np.nan,
+        'DNA': np.nan})
+
+# 3. CREATE SATISFACTION SCORE
+
+df_clean["satisfaction"] = df_clean[sat_cols].mean(axis=1)
+
+# Drop missing values
+df_model = df_clean.dropna(subset=["satisfaction", "state_name"]).copy()
+
+# 4. CREATE ADDITIONAL VARIABLES
+# Insurance (adjust column name if needed)
+if "insurance" in df_model.columns:
+    df_model["any_insurance"] = (df_model["insurance"] == "Yes").astype(int)
+else:
+    df_model["any_insurance"] = 0
+
+# Residence
+if "residence" not in df_model.columns:
+    df_model["residence"] = "Urban"
+
+# Region mapping
+north = ['Delhi','Haryana','Punjab','Uttar Pradesh','Himachal Pradesh','Jammu & Kashmir']
+south = ['Tamil Nadu','Kerala','Karnataka','Andhra Pradesh','Telangana']
+northeast = ['Assam','Meghalaya','Manipur','Mizoram','Nagaland','Tripura','Arunachal Pradesh']
+
+def map_region(state):
+    if state in north:
+        return "North"
+    elif state in south:
+        return "South"
+    elif state in northeast:
+        return "Northeast"
+    else:
+        return "Other"
+
+df_model["region"] = df_model["state_name"].apply(map_region)
+
+# Convert to categorical
+df_model["state_name"] = df_model["state_name"].astype("category")
+df_model["region"] = df_model["region"].astype("category")
+df_model["any_insurance"] = df_model["any_insurance"].astype("category")
+df_model["residence"] = df_model["residence"].astype("category")
+
+
+# 5. FIT LINEAR MIXED MODEL
+lmm = smf.mixedlm(
+    "satisfaction ~ any_insurance + residence + region",
+    data=df_model,
+    groups=df_model["state_name"]
+)
+
+lmm_result = lmm.fit()
+
+print(lmm_result.summary())
+
+# 6. GET ADJUSTED STATE-LEVEL SATISFACTION
+
+# Predicted values
+df_model["predicted"] = lmm_result.predict(df_model)
+
+# Aggregate by state
+state_pred = df_model.groupby("state_name")["predicted"].mean()
+
+# Convert to dataframe
+state_plot_df = state_pred.reset_index()
+state_plot_df.columns = ["state_name", "adjusted_satisfaction"]
+
+# Sort states
+state_plot_df = state_plot_df.sort_values("adjusted_satisfaction")
+
+# 7. PLOT STATE-WISE SATISFACTION
+
+plt.figure(figsize=(14,6))
+
+plt.bar(state_plot_df["state_name"], state_plot_df["adjusted_satisfaction"])
+
+plt.xticks(rotation=90)
+plt.xlabel("State")
+plt.ylabel("Adjusted Satisfaction Score")
+plt.title("State-wise Healthcare Satisfaction (Mixed Effects Model)")
+
+plt.tight_layout()
+plt.show()
+import numpy as np
+
+sat_cols = ["b6p","b6q","b6r","b6s","b6w","b6y"]
+
+for col in sat_cols:
+    df_clean[col] = df_clean[col].replace({
+        'Yes': 1,
+        'No': 0,
+        'CNS': np.nan,
+        'DNA': np.nan})
+df_clean["satisfaction"] = df_clean[sat_cols].mean(axis=1)
+
+df_model = df_clean.dropna(subset=["satisfaction", "state_name"]).copy()
+# State encoding
+df_model["state_idx"] = df_model["state_name"].astype("category").cat.codes
+state_names = df_model["state_name"].astype("category").cat.categories
+n_states = len(state_names)
+
+# Residence (Urban/Rural)
+df_model["residence_code"] = df_model["residence"].astype("category").cat.codes
+
+# Insurance
+df_model["insurance_code"] = df_model["any_insurance"].astype("category").cat.codes
+
+# Age group (optional but strong variable)
+if "rec_a2b_age" in df_model.columns:
+    df_model["age_code"] = df_model["rec_a2b_age"].astype("category").cat.codes
+    n_age = df_model["age_code"].nunique()
+else:
+    df_model["age_code"] = 0
+    n_age = 1
+
+# Final arrays
+y = df_model["satisfaction"].values
+state_idx = df_model["state_idx"].values
+residence = df_model["residence_code"].values
+insurance = df_model["insurance_code"].values
+age = df_model["age_code"].values
+import pymc as pm
+import arviz as az
+
+with pm.Model() as model:
+
+    # Global intercept
+    mu_global = pm.Normal("mu_global", mu=0.5, sigma=1)
+
+    # State-level variation (hierarchical)
+    sigma_state = pm.HalfNormal("sigma_state", sigma=1)
+    state_effect = pm.Normal("state_effect", 0, sigma_state, shape=n_states)
+
+    # Fixed effects
+    beta_residence = pm.Normal("beta_residence", 0, 1)
+    beta_insurance = pm.Normal("beta_insurance", 0, 1)
+
+    # Optional: age effect
+    beta_age = pm.Normal("beta_age", 0, 1, shape=n_age)
+
+    # Linear predictor
+    mu = (
+        mu_global
+        + state_effect[state_idx]
+        + beta_residence * residence
+        + beta_insurance * insurance
+        + beta_age[age])
+
+    # Likelihood
+    sigma = pm.HalfNormal("sigma", sigma=1)
+    y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
+
+    # Sampling
+    trace = pm.sample(1000, tune=1000, target_accept=0.9, return_inferencedata=True)
+    # Create state index properly
+df_model["state_id"] = df_model["state_name"].astype("category").cat.codes
+
+# Number of states
+n_states = df_model["state_id"].nunique()
