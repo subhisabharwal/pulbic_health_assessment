@@ -1,0 +1,235 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+df = pd.read_csv("converted_file.csv")
+
+print(df.shape)
+print(df.info())
+print(df.describe(include='all'))
+state_counts = df["state_name"].value_counts()
+print(state_counts)
+state_counts.plot(kind="bar", figsize=(12,5))
+plt.title("Sample Size per State")
+plt.show()
+missing = df.isnull().sum().sort_values(ascending=False)
+print(missing.head(20))
+drop_cols = [col for col in df.columns if 'oth' in col.lower()]
+df = df.drop(columns=drop_cols)
+threshold = 0.8 * len(df)
+df = df.dropna(axis=1, thresh=threshold)
+print(df.shape)
+cols_use = [
+    'state_name',
+    'residence',
+    'a2b_age',
+    'a2c',
+    'any_insurance',
+    "b6p","b6q","b6r","b6s","b6v","b6w","b6y",
+    'oope_total_op',
+    'b6m','b6i']
+
+df_clean = df[cols_use].copy()
+sat_cols = ["b6p","b6q","b6r","b6s","b6w","b6y"]
+
+for col in sat_cols:
+    df_clean[col] = df_clean[col].replace({'Yes': 1,'No': 0,'CNS': np.nan,'DNA': np.nan})
+for col in sat_cols:
+    print(col, df_clean[col].unique()[:5])
+df_clean['b6v'] = df_clean['b6v'].replace({
+    'Yes-completely': 1,
+    'Yes-partially': 0.5,
+    'No': 0,
+    'CNS': np.nan,
+    'DNA': np.nan})
+for col in sat_cols + ['b6v']:
+    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+df_clean['overall_sat'] = df_clean[sat_cols + ['b6v']].mean(axis=1)
+print(df_clean['overall_sat'].describe())
+# Keep only valid responses for the binary outcome
+df_model = df[df['b6y'].isin(['Yes', 'No'])].dropna(subset=['b6y', 'state_name']).copy()
+
+# Binary outcome
+df_model['y_bin'] = df_model['b6y'].map({'Yes': 1, 'No': 0})
+
+df_model['satisfaction'] = df_model['y_bin']
+
+# Insurance
+df_model['any_insurance'] = df_model['any_insurance'].str.strip().str.lower()
+df_model['insurance'] = df_model['any_insurance'].map({
+    'have insurance': 1,
+    'no insurance': 0
+}).fillna(0).astype(int)
+
+# Public vs Private provider
+df_model['public'] = df_model['b1_most'].str.contains(
+    'government|public', case=False, na=False
+).astype(int)
+
+# Rural vs Urban
+df_model['rural'] = (df_model['residence'] == 'Rural').astype(int)
+
+# Standardize cost (oope_total_op) and wait (b6m)
+for raw_col, new_col in [('oope_total_op', 'cost'), ('b6m', 'wait')]:
+    if raw_col in df_model.columns:
+        col_data = pd.to_numeric(df_model[raw_col], errors='coerce')
+        df_model[new_col] = (col_data - col_data.mean()) / col_data.std()
+        df_model[new_col] = df_model[new_col].fillna(0)
+    else:
+        df_model[new_col] = 0.0
+
+# State index (needed for hierarchical model)
+df_model['state_id'] = pd.factorize(df_model['state_name'])[0]
+n_states = df_model['state_id'].nunique()
+
+print('Prepared data shape:', df_model.shape)
+print(df_model[['y_bin','insurance','public','rural','cost','wait']].isna().sum())
+import pymc as pm
+
+with pm.Model() as model:
+
+    # Global intercept
+    alpha = pm.Normal('alpha', mu=0, sigma=5)
+
+    # State-level random effects
+    sigma_state = pm.HalfNormal('sigma_state', sigma=2)
+    state_effect = pm.Normal('state_effect', mu=0, sigma=sigma_state, shape=n_states)
+
+    # Fixed effects
+    beta_ins   = pm.Normal('beta_ins',   mu=0, sigma=2)
+    beta_pub   = pm.Normal('beta_pub',   mu=0, sigma=2)
+    beta_rural = pm.Normal('beta_rural', mu=0, sigma=2)
+    beta_cost  = pm.Normal('beta_cost',  mu=0, sigma=2)
+    beta_wait  = pm.Normal('beta_wait',  mu=0, sigma=2)
+
+    # Linear predictor (log-odds)
+    mu = (alpha+ state_effect[df_model['state_id'].values]+ beta_ins* df_model['insurance'].values+ beta_pub * df_model['public'].values+ beta_rural * df_model['rural'].values+ beta_cost  * df_model['cost'].values+ beta_wait  * df_model['wait'].values)
+
+    # Likelihood — Bernoulli (binary outcome)
+    y_obs = pm.Bernoulli('y_obs', logit_p=mu, observed=df_model['y_bin'].values)
+
+    # Sample
+    trace = pm.sample(1000, tune=1000, target_accept=0.9, random_seed=42)
+
+print('Model fitted successfully')
+import arviz as az
+
+az.summary(trace, var_names=[
+    'alpha', 'beta_ins', 'beta_pub',
+    'beta_rural', 'beta_cost', 'beta_wait',
+    'sigma_state'])
+az.plot_trace(trace, var_names=['alpha','beta_ins','beta_pub','beta_rural','beta_cost','beta_wait','sigma_state'])
+plt.tight_layout()
+plt.show()
+az.plot_posterior(trace, var_names=['beta_ins','beta_pub','beta_rural','beta_cost','beta_wait','sigma_state'])
+plt.tight_layout()
+plt.show()
+state_effects = trace.posterior['state_effect'].mean(dim=('chain','draw')).values
+states = df_model['state_name'].astype('category').cat.categories
+
+state_df = pd.DataFrame({'state': states, 'bayes_effect': state_effects})\
+             .sort_values('bayes_effect')
+
+print(state_df.head(), state_df.tail())
+classical = df_model.groupby('state_name')['satisfaction'].mean()
+bayes = state_df.set_index('state')['bayes_effect']
+
+plt.scatter(classical, bayes)
+plt.plot([classical.min(), classical.max()],
+         [classical.min(), classical.max()], 'r--')
+plt.xlabel('Classical mean')
+plt.ylabel('Bayesian estimate')
+plt.title('Shrinkage: Classical vs Bayesian')
+plt.show()
+comp = pd.DataFrame({
+    'classical_rank': classical.rank(ascending=False),
+    'bayesian_rank':  bayes.rank(ascending=False)
+}).assign(rank_change=lambda d: d['classical_rank'] - d['bayesian_rank'])
+
+print('Biggest upward movers:')
+print(comp.sort_values('rank_change').head(10))
+print('\nBiggest downward movers:')
+print(comp.sort_values('rank_change').tail(10))
+north = [
+    'Uttar Pradesh', 'Punjab', 'Haryana', 'Rajasthan',
+    'Uttarakhand', 'Himachal Pradesh', 'Jammu & Kashmir', 'Nct Of Delhi'
+]
+south = [
+    'Tamil Nadu', 'Kerala', 'Karnataka',
+    'Andhra Pradesh', 'Telangana'
+]
+northeast = [
+    'Assam', 'Arunachal Pradesh', 'Manipur',
+    'Meghalaya', 'Mizoram', 'Nagaland', 'Tripura', 'Sikkim'
+]
+
+def get_region(state):
+    if state in north:     return 'North'
+    elif state in south:   return 'South'
+    elif state in northeast: return 'Northeast'
+    else:                  return 'Central/Other'
+
+df_model['region'] = df_model['state_name'].apply(get_region)
+print(df_model['region'].value_counts())
+region_map_df = df_model[['state_name','region']].drop_duplicates()
+
+state_df = state_df.merge(region_map_df, left_on='state', right_on='state_name')
+
+region_bayes = state_df.groupby('region')['bayes_effect'].mean().reset_index()
+print(region_bayes)
+plt.bar(region_bayes['region'], region_bayes['bayes_effect'])
+plt.title('Bayesian-adjusted Satisfaction by Region')
+plt.ylabel('Adjusted Satisfaction (log-odds)')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+state_effects = trace.posterior['state_effect'].mean(dim=('chain','draw')).values
+states = df_model['state_name'].astype('category').cat.categories
+alpha_mean = float(trace.posterior['alpha'].mean())
+
+state_bayes_df = pd.DataFrame({
+    'state_name': states,
+    'bayes_effect': state_effects
+})
+state_bayes_df['bayes_satisfaction'] = state_bayes_df['bayes_effect'] + alpha_mean
+state_bayes_df = state_bayes_df.sort_values('bayes_satisfaction')
+
+print(f'NaN in bayes_satisfaction: {state_bayes_df["bayes_satisfaction"].isna().sum()}')
+plt.figure(figsize=(14,6))
+plt.bar(state_bayes_df['state_name'], state_bayes_df['bayes_satisfaction'])
+plt.xticks(rotation=90)
+plt.ylabel('Bayesian Adjusted Satisfaction (log-odds)')
+plt.title('State-wise Satisfaction (Bayesian Adjusted)')
+plt.tight_layout()
+plt.show()
+state_classical = (
+    df_model.groupby('state_name')['satisfaction']
+    .mean().reset_index()
+    .rename(columns={'satisfaction': 'classical_mean'})
+)
+state_counts_df = (
+    df_model['state_name'].value_counts()
+    .reset_index()
+)
+state_counts_df.columns = ['state_name', 'sample_size']
+
+comparison = (state_bayes_df
+    .merge(state_classical, on='state_name')
+    .merge(state_counts_df, on='state_name')
+)
+comparison['difference'] = comparison['bayes_satisfaction'] - comparison['classical_mean']
+
+print('Smallest states (most shrinkage expected):')
+print(comparison.sort_values('sample_size').head(10))
+print('\nLargest states:')
+print(comparison.sort_values('sample_size', ascending=False).head(10))
+plt.scatter(comparison['sample_size'], comparison['difference'].abs())
+plt.xlabel('Sample Size')
+plt.ylabel('Magnitude of Bayesian Adjustment')
+plt.title('Sample Size vs Bayesian Adjustment')
+plt.show()
+with model:
+    ppc = pm.sample_posterior_predictive(trace, return_inferencedata=True)
+
+az.plot_ppc(ppc)
+plt.show()
